@@ -61,12 +61,12 @@ services:
       - "${WEBUI_PORT_PLEX:?err}:32400"         # WebUI Portal: Plex
 #      - 1900:1900/udp                           # DNLA Service       (Clashes with Synology: SSPD "File Services" --> "Advanced")
 #      - 5353:5353/udp                           # Plex Network Port  (Clashes with Synology: Bonjour "File Services" --> "Advanced")
-      - 8324:8324                               # Plex Network Port
-      - 32410:32410/udp                         # Plex Network Port
-      - 32412:32412/udp                         # Plex Network Port
-      - 32413:32413/udp                         # Plex Network Port
-      - 32414:32414/udp                         # Plex Network Port
-      - 32469:32469                             # Plex Network Port
+#      - 8324:8324                               # Plex Network Port
+#      - 32410:32410/udp                         # Plex Network Port
+#      - 32412:32412/udp                         # Plex Network Port
+#      - 32413:32413/udp                         # Plex Network Port
+#      - 32414:32414/udp                         # Plex Network Port
+#      - 32469:32469                             # Plex Network Port
 
     volumes:
       - ${FOLDER_FOR_DATA:?err}/gluetun:/gluetun
@@ -248,20 +248,20 @@ services:
 ##
 ###########################################################################
 ###########################################################################
-#  flaresolverr:
-#    image: ghcr.io/flaresolverr/flaresolverr:latest
-#    container_name: flaresolverr
-#    restart: unless-stopped
-#    depends_on:
-#      gluetun:
-#        condition: service_healthy
-#        restart: true
-#    environment:
-#      - LOG_LEVEL=info
-#      - LOG_HTML=false
-#      - CAPTCHA_SOLVER=none
-#      - TZ=${TIMEZONE:?err}
-#    network_mode: "service:gluetun"
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=${TIMEZONE:?err}
+    network_mode: "service:gluetun"
 #    ports:
 #      - "${FLARESOLVERR_PORT:?err}:8191"             # Configured in Gluetun VPN container
 
@@ -499,9 +499,9 @@ services:
         condition: service_healthy
         restart: true
 # Add Configurations for GPU Hardware Rendering Here:
-#    devices:
-#      - /dev/dri/renderD128:/dev/dri/renderD128
-#      - /dev/dri/card0:/dev/dri/card0
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
     volumes:
       - ${FOLDER_FOR_DATA:?err}/plex:/config
       - ${FOLDER_FOR_MEDIA:?err}/media:/data/media
