@@ -175,7 +175,7 @@ services:
       - ${FOLDER_FOR_DATA:?err}/valkey:/data
 
   authentik:
-    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:?err}
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-latest}
     container_name: authentik
     restart: unless-stopped
     networks:
@@ -188,9 +188,9 @@ services:
       - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
       - AUTHENTIK_REDIS__HOST=valkey
       - AUTHENTIK_POSTGRESQL__HOST=postgresql
-      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:?err}
-      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:?err}
-      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?err}
+      - AUTHENTIK_POSTGRESQL__NAME=${PG_DB:-authentik}
+      - AUTHENTIK_POSTGRESQL__USER=${PG_USER:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${PG_PASS}
       - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
     volumes:
       - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
@@ -580,29 +580,6 @@ services:
     network_mode: "service:gluetun"
     healthcheck:
       test: ["CMD", "pgrep", "whisparr"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  prowlarr:
-    image: lscr.io/linuxserver/prowlarr:develop
-    container_name: prowlarr
-    restart: unless-stopped
-    depends_on:
-      gluetun:
-        condition: service_healthy
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/prowlarr:/config
-    environment:
-      - PUID=${PUID:?err}
-      - PGID=${PGID:?err}
-      - TZ=${TIMEZONE:?err}
-      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:prowlarr
-      - TP_THEME=${TP_THEME:?err}
-    network_mode: "service:gluetun"
-    healthcheck:
-      test: ["CMD", "pgrep", "prowlarr"]
       interval: 30s
       timeout: 10s
       retries: 5
