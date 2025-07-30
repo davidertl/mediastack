@@ -1,0 +1,637 @@
+version: "3.8"
+
+networks:
+  mediastack:
+    name: mediastack
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "${DOCKER_SUBNET:?Add to your env file}"
+          gateway: "${DOCKER_GATEWAY:?Add to your env file}"
+
+services:
+###########################################################################
+# TRAEFIK REVERSE PROXY
+###########################################################################
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: root
+    ports:
+      - "${REVERSE_PROXY_PORT_HTTP:-80}:80"
+      - "${REVERSE_PROXY_PORT_HTTPS:-443}:443"
+      - "${WEBUI_PORT_TRAEFIK:-8080}:8080"
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - CF_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:?err}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${FOLDER_FOR_DATA:?err}/logs/traefik:/var/log
+      - ${FOLDER_FOR_DATA:?err}/traefik:/etc/traefik
+      - ${FOLDER_FOR_DATA:?err}/traefik/letsencrypt:/letsencrypt
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.traefik.rule=Host(`traefik.${CLOUDFLARE_DNS_ZONE:?err}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))
+      - traefik.http.routers.traefik.entrypoints=secureweb
+      - traefik.http.routers.traefik.service=api@internal
+      - traefik.http.routers.traefik.middlewares=authentik-forwardauth@file,security-headers@file,traefik-bouncer@file
+      - traefik.http.services.traefik.loadbalancer.server.scheme=http
+      - traefik.http.services.traefik.loadbalancer.server.port=8080
+
+###########################################################################
+# CLOUDFLARED (Cloudflare Tunnel)
+###########################################################################
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN:?err}
+    networks:
+      - mediastack
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+###########################################################################
+# GLUETUN (VPN CLIENT)
+###########################################################################
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "${WEBUI_PORT_QBITTORRENT:-8200}:8200"
+      - "${QBIT_PORT:-6881}:6881"
+      - "${WEBUI_PORT_BAZARR:-6767}:6767"
+      - "${WEBUI_PORT_JELLYFIN:-8096}:8096"
+      - "${WEBUI_PORT_JELLYSEERR:-5055}:5055"
+      - "${WEBUI_PORT_LIDARR:-8686}:8686"
+      - "${WEBUI_PORT_MYLAR:-8090}:8090"
+      - "${WEBUI_PORT_PROWLARR:-9696}:9696"
+      - "${WEBUI_PORT_RADARR:-7878}:7878"
+      - "${WEBUI_PORT_READARR:-8787}:8787"
+      - "${WEBUI_PORT_SABNZBD:-8080}:8080"
+      - "${WEBUI_PORT_SONARR:-8989}:8989"
+      - "${WEBUI_PORT_WHISPARR:-6969}:6969"
+      - "${WEBUI_PORT_FILEBOT:-5454}:5454"
+      - "${WEBUI_PORT_PLEX:-32400}:32400"
+      - "${WEBUI_PORT_TDARR:-8265}:8265"
+      - "${FLARESOLVERR_PORT:-8191}:8191"
+      - "${TDARR_SERVER_PORT:-8266}:8266"
+      - "8888:8888/tcp"
+      - "8388:8388/tcp"
+      - "8388:8388/udp"
+      - "${GLUETUN_CONTROL_PORT:?err}:${GLUETUN_CONTROL_PORT:?err}"
+    volumes:
+      - "${FOLDER_FOR_DATA:?err}/gluetun:/gluetun"
+    environment:
+      PUID: "${PUID:?err}"
+      PGID: "${PGID:?err}"
+      UMASK: "${UMASK:?err}"
+      TZ: "${TIMEZONE:?err}"
+      VPN_SERVICE_PROVIDER: "${VPN_SERVICE_PROVIDER:?err}"
+      OPENVPN_USER: "${VPN_USERNAME:?err}"
+      OPENVPN_PASSWORD: "${VPN_PASSWORD:?err}"
+      SERVER_CATEGORIES: "${SERVER_CATEGORIES}"
+      SERVER_CITIES: "${SERVER_CITIES}"
+      SERVER_COUNTRIES: "${SERVER_COUNTRIES}"
+      SERVER_HOSTNAMES: "${SERVER_HOSTNAMES}"
+      SERVER_REGIONS: "${SERVER_REGIONS}"
+      FIREWALL_OUTBOUND_SUBNETS: "${LOCAL_SUBNET:?err}"
+      OPENVPN_CUSTOM_CONFIG: "${OPENVPN_CUSTOM_CONFIG}"
+      HTTP_CONTROL_SERVER_ADDRESS: ":${GLUETUN_CONTROL_PORT:?err}"
+      VPN_TYPE: "${VPN_TYPE}"
+      VPN_ENDPOINT_IP: "${VPN_ENDPOINT_IP}"
+      VPN_ENDPOINT_PORT: "${VPN_ENDPOINT_PORT}"
+      WIREGUARD_PUBLIC_KEY: "${WIREGUARD_PUBLIC_KEY}"
+      WIREGUARD_PRIVATE_KEY: "${WIREGUARD_PRIVATE_KEY}"
+      WIREGUARD_PRESHARED_KEY: "${WIREGUARD_PRESHARED_KEY}"
+      WIREGUARD_ADDRESSES: "${WIREGUARD_ADDRESSES}"
+      HTTPPROXY: "on"
+      SHADOWSOCKS: "on"
+    networks:
+      - mediastack
+    healthcheck:
+      test: ["CMD", "pgrep", "gluetun"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+###########################################################################
+# AUTHENTIK (Upstream-Variante)
+###########################################################################
+  postgresql:
+    image: docker.io/library/postgres:latest
+    container_name: postgresql
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    ports:
+      - ${POSTGRESQL_PORT:-5432}:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/postgresql:/var/lib/postgresql/data
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - POSTGRES_DB=${AUTHENTIK_DATABASE:?err}
+      - POSTGRES_USER=${POSTGRESQL_USERNAME:?err}
+      - POSTGRES_PASSWORD=${POSTGRESQL_PASSWORD:?err}
+
+  valkey:
+    image: valkey/valkey:alpine
+    container_name: valkey
+    command: --save 60 1 --loglevel warning
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    ports:
+      - ${VALKEY_PORT:-6379}:6379
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 3s
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/valkey:/data
+
+  authentik:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:?err}
+    container_name: authentik
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    command: server
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - AUTHENTIK_LOG_LEVEL=info
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
+      - AUTHENTIK_REDIS__HOST=valkey
+      - AUTHENTIK_POSTGRESQL__HOST=postgresql
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:?err}
+      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:?err}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?err}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
+      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
+    ports:
+      - ${WEBUI_PORT_AUTHENTIK:-9000}:9000
+    depends_on:
+      postgresql:
+        condition: service_healthy
+        restart: true
+      valkey:
+        condition: service_healthy
+        restart: true
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.authentik.service=authentik
+      - traefik.http.routers.authentik.rule=Host(`auth.${CLOUDFLARE_DNS_ZONE:?err}`)
+      - traefik.http.routers.authentik.entrypoints=secureweb
+      - traefik.http.routers.authentik.middlewares=security-headers@file,traefik-bouncer@file
+      - traefik.http.services.authentik.loadbalancer.server.scheme=http
+      - traefik.http.services.authentik.loadbalancer.server.port=9000
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:?err}
+    container_name: authentik-worker
+    restart: unless-stopped
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    command: worker
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
+      - AUTHENTIK_REDIS__HOST=valkey
+      - AUTHENTIK_POSTGRESQL__HOST=postgresql
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:?err}
+      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:?err}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?err}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${FOLDER_FOR_DATA:?err}/authentik/certs:/certs
+      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
+      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
+    depends_on:
+      postgresql:
+        condition: service_healthy
+        restart: true
+      valkey:
+        condition: service_healthy
+        restart: true
+
+###########################################################################
+# CROWDSEC (Security Engine)
+###########################################################################
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: always
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    environment:
+      - TZ=${TIMEZONE:?err}
+    ports:
+      - 127.0.0.1:${CROWDSEC_PORT:-8080}:8080
+      - 6060:6060        # Metrics (optional)
+      - 7422:7422        # WAF AppSec
+    depends_on:
+      - traefik
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/crowdsec:/etc/crowdsec
+      - ${FOLDER_FOR_DATA:?err}/crowdsec/data:/var/lib/crowdsec/data/
+      - ${FOLDER_FOR_DATA:?err}/logs:/logs:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "crowdsec"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+###########################################################################
+# MEDIA & ARR SERVICES (alle mit Healthcheck, über Gluetun getunnelt)
+###########################################################################
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/jellyfin:/config
+      - ${FOLDER_FOR_MEDIA:?err}/media:/data/media
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - UMASK=${UMASK:?err}
+      - TZ=${TIMEZONE:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "ps", "-ef", "|", "grep", "jellyfin", "|", "grep", "-v", "grep"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/plex:/config
+      - ${FOLDER_FOR_MEDIA:?err}/media:/data/media
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - UMASK=${UMASK:?err}
+      - TZ=${TIMEZONE:?err}
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "Plex Media Server"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/bazarr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:bazarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "bazarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/jellyseerr:/app/config
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - UMASK=${UMASK:?err}
+      - TZ=${TIMEZONE:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(require('fs').existsSync('/app/config/config.json') ? 0 : 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  filebot:
+    image: rednoah/filebot:xpra
+    container_name: filebot
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/filebot:/data/filebot
+      - ${FOLDER_FOR_MEDIA:?err}/filebot:/filebot
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - UMASK=${UMASK:?err}
+      - TZ=${TIMEZONE:?err}
+      - DARK_MODE=1
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "java"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/lidarr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:lidarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "lidarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  mylar:
+    image: lscr.io/linuxserver/mylar3:latest
+    container_name: mylar
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/mylar:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:mylar3
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "mylar3"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:develop
+    container_name: prowlarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/prowlarr:/config
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:prowlarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "prowlarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/radarr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:radarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "radarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  readarr:
+    image: lscr.io/linuxserver/readarr:amd64-0.4.3-develop
+    container_name: readarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/readarr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:readarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "readarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/sabnzbd:/config
+      - ${FOLDER_FOR_MEDIA:?err}/downloads:/downloads
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "sabnzbd"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/sonarr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:sonarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "sonarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  whisparr:
+    image: lscr.io/linuxserver/whisparr:latest
+    container_name: whisparr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/whisparr:/config
+      - ${FOLDER_FOR_MEDIA:?err}:/data
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:whisparr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "whisparr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:develop
+    container_name: prowlarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/prowlarr:/config
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:prowlarr
+      - TP_THEME=${TP_THEME:?err}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "prowlarr"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  qBittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/qbittorrent:/config
+      - ${FOLDER_FOR_MEDIA:?err}/downloads:/downloads
+    environment:
+      - PUID=${PUID:?err}
+      - PGID=${PGID:?err}
+      - TZ=${TIMEZONE:?err}
+      - UMASK=${UMASK:?err}
+      - WEBUI_PORT=${WEBUI_PORT_QBITTORRENT:-8200}
+    network_mode: "service:gluetun"
+    healthcheck:
+      test: ["CMD", "pgrep", "qbittorrent-nox"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+volumes:
+  redis:
