@@ -1,5 +1,3 @@
-version: "3.8"
-
 networks:
   mediastack:
     name: mediastack
@@ -24,7 +22,7 @@ services:
     ports:
       - "${REVERSE_PROXY_PORT_HTTP:-80}:80"
       - "${REVERSE_PROXY_PORT_HTTPS:-443}:443"
-      - "${WEBUI_PORT_TRAEFIK:-8080}:8080"
+      - "${WEBUI_PORT_TRAEFIK:-8080}:${WEBUI_PORT_TRAEFIK:-8080}"
     environment:
       - TZ=${TIMEZONE:?err}
       - CF_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:?err}
@@ -40,7 +38,7 @@ services:
       - traefik.http.routers.traefik.service=api@internal
       - traefik.http.routers.traefik.middlewares=authentik-forwardauth@file,security-headers@file,traefik-bouncer@file
       - traefik.http.services.traefik.loadbalancer.server.scheme=http
-      - traefik.http.services.traefik.loadbalancer.server.port=8080
+      - traefik.http.services.traefik.loadbalancer.server.port=${WEBUI_PORT_TRAEFIK:-8080}
 
 ###########################################################################
 # CLOUDFLARED (Cloudflare Tunnel)
@@ -54,6 +52,177 @@ services:
       - mediastack
     healthcheck:
       test: ["CMD", "cloudflared", "tunnel", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+###########################################################################
+# AUTHENTIK (Upstream-Variante)
+###########################################################################
+  postgresql:
+    image: docker.io/library/postgres:latest
+    container_name: postgresql-authentik
+    restart: unless-stopped
+    networks:
+      - mediastack
+    ports:
+      - ${POSTGRESQL_PORT:-5432}:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${PG_DB} -U $${PG_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/postgresql:/var/lib/postgresql/data
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - POSTGRES_DB=${AUTHENTIK_DATABASE:?err}
+      - POSTGRES_USER=${POSTGRESQL_USERNAME:?err}
+      - POSTGRES_PASSWORD=${POSTGRESQL_PASSWORD:?err}
+
+  valkey:
+    image: valkey/valkey:alpine
+    container_name: valkey
+    command: --save 60 1 --loglevel warning
+    restart: unless-stopped
+    networks:
+      - mediastack
+    ports:
+      - ${VALKEY_PORT:-6379}:6379
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 3s
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/valkey:/data
+
+  authentik:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-latest}
+    container_name: authentik
+    restart: unless-stopped
+    user: ${PUID:?err}:${PGID:?err}
+    networks:
+      - mediastack
+    command: server
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - AUTHENTIK_LOG_LEVEL=info
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
+      - AUTHENTIK_REDIS__HOST=valkey
+      - AUTHENTIK_POSTGRESQL__HOST=postgresql
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:-authentik}
+      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:-authentik}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?Postgres password is required}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
+      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
+    ports:
+      - ${WEBUI_PORT_AUTHENTIK:-9000}:9000
+     # - ${COMPOSE_PORT_HTTPS:-9443}:9443
+    depends_on:
+      postgresql:
+        condition: service_healthy
+        restart: true
+      valkey:
+        condition: service_healthy
+        restart: true
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.authentik.service=authentik
+      - traefik.http.routers.authentik.rule=Host(`auth.${CLOUDFLARE_DNS_ZONE:?err}`)
+      - traefik.http.routers.authentik.entrypoints=secureweb
+      - traefik.http.routers.authentik.middlewares=security-headers@file,traefik-bouncer@file
+      - traefik.http.services.authentik.loadbalancer.server.scheme=http
+      - traefik.http.services.authentik.loadbalancer.server.port=9000
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:?err}
+    container_name: authentik-worker
+    restart: unless-stopped
+    user: ${PUID:?err}:${PGID:?err}
+    networks:
+      - mediastack
+    command: worker
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
+      - AUTHENTIK_REDIS__HOST=valkey
+      - AUTHENTIK_POSTGRESQL__HOST=postgresql
+      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:?err}
+      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:?err}
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?err}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${FOLDER_FOR_DATA:?err}/certs:/certs
+      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
+      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
+    depends_on:
+      postgresql:
+        condition: service_healthy
+        restart: true
+      valkey:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD", "ps", "-ef", "|", "grep", "worker", "|", "grep", "-v", "grep"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+###########################################################################
+# WATCHTOWER (Container Auto-Update)
+###########################################################################
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    networks:
+      - mediastack
+    user: ${PUID:?err}:${PGID:?err}
+    environment:
+      - TZ=${TIMEZONE:?err}
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=3600
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+###########################################################################
+# CROWDSEC (Security Engine)
+###########################################################################
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: always
+    user: ${PUID:?err}:${PGID:?err}
+    networks:
+      - mediastack
+    environment:
+      - TZ=${TIMEZONE:?err}
+    ports:
+      - 127.0.0.1:${WEBUI_PORT_CROWDSEC:-8080}:8080
+      - 6060:6060        # Metrics (optional)
+      - 7422:7422        # WAF AppSec
+    depends_on:
+      - traefik
+    volumes:
+      - ${FOLDER_FOR_DATA:?err}/crowdsec:/etc/crowdsec
+      - ${FOLDER_FOR_DATA:?err}/crowdsec/data:/var/lib/crowdsec/data/
+      - ${FOLDER_FOR_DATA:?err}/logs:/logs:ro
+    healthcheck:
+      test: ["CMD", "pgrep", "crowdsec"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -83,7 +252,6 @@ services:
       - "${WEBUI_PORT_READARR:-8787}:8787"
       - "${WEBUI_PORT_SABNZBD:-8080}:8080"
       - "${WEBUI_PORT_SONARR:-8989}:8989"
-      - "${WEBUI_PORT_WHISPARR:-6969}:6969"
       - "${WEBUI_PORT_FILEBOT:-5454}:5454"
       - "${WEBUI_PORT_PLEX:-32400}:32400"
       - "${WEBUI_PORT_TDARR:-8265}:8265"
@@ -130,155 +298,13 @@ services:
       start_period: 30s
 
 ###########################################################################
-# AUTHENTIK (Upstream-Variante)
-###########################################################################
-  postgresql:
-    image: docker.io/library/postgres:latest
-    container_name: postgresql
-    restart: unless-stopped
-    networks:
-      - mediastack
-    user: ${PUID:?err}:${PGID:?err}
-    ports:
-      - ${POSTGRESQL_PORT:-5432}:5432
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
-      start_period: 20s
-      interval: 30s
-      retries: 5
-      timeout: 5s
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/postgresql:/var/lib/postgresql/data
-    environment:
-      - TZ=${TIMEZONE:?err}
-      - POSTGRES_DB=${AUTHENTIK_DATABASE:?err}
-      - POSTGRES_USER=${POSTGRESQL_USERNAME:?err}
-      - POSTGRES_PASSWORD=${POSTGRESQL_PASSWORD:?err}
-
-  valkey:
-    image: valkey/valkey:alpine
-    container_name: valkey
-    command: --save 60 1 --loglevel warning
-    restart: unless-stopped
-    networks:
-      - mediastack
-    user: ${PUID:?err}:${PGID:?err}
-    ports:
-      - ${VALKEY_PORT:-6379}:6379
-    healthcheck:
-      test: ["CMD-SHELL", "valkey-cli ping | grep PONG"]
-      start_period: 20s
-      interval: 30s
-      retries: 5
-      timeout: 3s
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/valkey:/data
-
-  authentik:
-    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-latest}
-    container_name: authentik
-    restart: unless-stopped
-    networks:
-      - mediastack
-    user: ${PUID:?err}:${PGID:?err}
-    command: server
-    environment:
-      - TZ=${TIMEZONE:?err}
-      - AUTHENTIK_LOG_LEVEL=info
-      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
-      - AUTHENTIK_REDIS__HOST=valkey
-      - AUTHENTIK_POSTGRESQL__HOST=postgresql
-      - AUTHENTIK_POSTGRESQL__NAME=${PG_DB:-authentik}
-      - AUTHENTIK_POSTGRESQL__USER=${PG_USER:-authentik}
-      - AUTHENTIK_POSTGRESQL__PASSWORD=${PG_PASS}
-      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
-      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
-    ports:
-      - ${WEBUI_PORT_AUTHENTIK:-9000}:9000
-    depends_on:
-      postgresql:
-        condition: service_healthy
-        restart: true
-      valkey:
-        condition: service_healthy
-        restart: true
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.authentik.service=authentik
-      - traefik.http.routers.authentik.rule=Host(`auth.${CLOUDFLARE_DNS_ZONE:?err}`)
-      - traefik.http.routers.authentik.entrypoints=secureweb
-      - traefik.http.routers.authentik.middlewares=security-headers@file,traefik-bouncer@file
-      - traefik.http.services.authentik.loadbalancer.server.scheme=http
-      - traefik.http.services.authentik.loadbalancer.server.port=9000
-
-  authentik-worker:
-    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:?err}
-    container_name: authentik-worker
-    restart: unless-stopped
-    networks:
-      - mediastack
-    user: ${PUID:?err}:${PGID:?err}
-    command: worker
-    environment:
-      - TZ=${TIMEZONE:?err}
-      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY:?err}
-      - AUTHENTIK_REDIS__HOST=valkey
-      - AUTHENTIK_POSTGRESQL__HOST=postgresql
-      - AUTHENTIK_POSTGRESQL__NAME=${AUTHENTIK_DATABASE:?err}
-      - AUTHENTIK_POSTGRESQL__USER=${POSTGRESQL_USERNAME:?err}
-      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRESQL_PASSWORD:?err}
-      - AUTHENTIK_ERROR_REPORTING__ENABLED=${AUTHENTIK_ERROR_REPORTING__ENABLED:-false}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${FOLDER_FOR_DATA:?err}/authentik/certs:/certs
-      - ${FOLDER_FOR_DATA:?err}/authentik/media:/media
-      - ${FOLDER_FOR_DATA:?err}/authentik/templates:/templates
-    depends_on:
-      postgresql:
-        condition: service_healthy
-        restart: true
-      valkey:
-        condition: service_healthy
-        restart: true
-
-###########################################################################
-# CROWDSEC (Security Engine)
-###########################################################################
-  crowdsec:
-    image: crowdsecurity/crowdsec:latest
-    container_name: crowdsec
-    restart: always
-    networks:
-      - mediastack
-    user: ${PUID:?err}:${PGID:?err}
-    environment:
-      - TZ=${TIMEZONE:?err}
-    ports:
-      - 127.0.0.1:${CROWDSEC_PORT:-8080}:8080
-      - 6060:6060        # Metrics (optional)
-      - 7422:7422        # WAF AppSec
-    depends_on:
-      - traefik
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/crowdsec:/etc/crowdsec
-      - ${FOLDER_FOR_DATA:?err}/crowdsec/data:/var/lib/crowdsec/data/
-      - ${FOLDER_FOR_DATA:?err}/logs:/logs:ro
-    healthcheck:
-      test: ["CMD", "pgrep", "crowdsec"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-###########################################################################
 # MEDIA & ARR SERVICES (alle mit Healthcheck, über Gluetun getunnelt)
 ###########################################################################
   jellyfin:
     image: lscr.io/linuxserver/jellyfin:latest
     container_name: jellyfin
     restart: unless-stopped
+    user: ${PUID:?err}:${PGID:?err}
     depends_on:
       gluetun:
         condition: service_healthy
@@ -302,6 +328,7 @@ services:
     image: lscr.io/linuxserver/plex:latest
     container_name: plex
     restart: unless-stopped
+    user: ${PUID:?err}:${PGID:?err}
     depends_on:
       gluetun:
         condition: service_healthy
@@ -556,30 +583,6 @@ services:
     network_mode: "service:gluetun"
     healthcheck:
       test: ["CMD", "pgrep", "sonarr"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-
-  whisparr:
-    image: lscr.io/linuxserver/whisparr:latest
-    container_name: whisparr
-    restart: unless-stopped
-    depends_on:
-      gluetun:
-        condition: service_healthy
-    volumes:
-      - ${FOLDER_FOR_DATA:?err}/whisparr:/config
-      - ${FOLDER_FOR_MEDIA:?err}:/data
-    environment:
-      - PUID=${PUID:?err}
-      - PGID=${PGID:?err}
-      - TZ=${TIMEZONE:?err}
-      - DOCKER_MODS=ghcr.io/themepark-dev/theme.park:whisparr
-      - TP_THEME=${TP_THEME:?err}
-    network_mode: "service:gluetun"
-    healthcheck:
-      test: ["CMD", "pgrep", "whisparr"]
       interval: 30s
       timeout: 10s
       retries: 5
