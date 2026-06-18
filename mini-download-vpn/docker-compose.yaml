@@ -964,7 +964,7 @@ services:
       - traefik.http.routers.jellyfin.service=jellyfin
       - traefik.http.routers.jellyfin.rule=Host(`jellyfin.${CLOUDFLARE_DNS_ZONE:?err}`)
       - traefik.http.routers.jellyfin.entrypoints=secureweb
-      - traefik.http.routers.jellyfin.middlewares=authentik-forwardauth@file,security-headers@file,traefik-bouncer@file
+      - traefik.http.routers.jellyfin.middlewares=security-headers@file,traefik-bouncer@file
     # SERVICES
       - traefik.http.services.jellyfin.loadbalancer.server.scheme=http
       - traefik.http.services.jellyfin.loadbalancer.server.port=8096
@@ -1116,7 +1116,7 @@ services:
       - traefik.http.routers.plex.service=plex
       - traefik.http.routers.plex.rule=Host(`plex.${CLOUDFLARE_DNS_ZONE:?err}`) && PathPrefix(`/web/`)
       - traefik.http.routers.plex.entrypoints=secureweb
-      - traefik.http.routers.plex.middlewares=authentik-forwardauth@file,security-headers@file,traefik-bouncer@file
+      - traefik.http.routers.plex.middlewares=security-headers@file,traefik-bouncer@file
     # SERVICES
       - traefik.http.services.plex.loadbalancer.server.scheme=http
       - traefik.http.services.plex.loadbalancer.server.port=32400
